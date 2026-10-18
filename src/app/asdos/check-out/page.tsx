@@ -1,0 +1,643 @@
+'use client';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Check, Scan, ArrowLeft, BookOpen, AlertCircle, Loader2, Camera, Image as ImageIcon, RefreshCw } from 'lucide-react';
+import { submitCheckOut, type PresensiResponseDTO } from '@/lib/actions/presensi';
+
+import Link from 'next/link';
+import { AsdosQrScanSkeleton, AsdosPageShell, AsdosPageHeader } from '@/components/dashboard/asdos/AsdosUI';
+import { parseUTC } from '@/lib/jadwal-utils';
+
+function formatTeachingTeam(item: PresensiResponseDTO) {
+  return item.nama_asdos_rekan ? `${item.nama_asdos} & ${item.nama_asdos_rekan}` : item.nama_asdos;
+}
+
+
+
+export default function CheckOutPage() {
+  const MAX_HURUF = 100;
+
+  const [step, setStep] = useState(1);
+  const [materi, setMateri] = useState('');
+  const [activeTeachingTeam, setActiveTeachingTeam] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const [activePresensi, setActivePresensi] = useState<PresensiResponseDTO | null>(null);
+  const [qrToken, setQrToken] = useState('');
+  const [cameraStatus, setCameraStatus] = useState<'idle' | 'requesting' | 'active' | 'denied' | 'scanning'>('idle');
+  const [scanMessage, setScanMessage] = useState<string>('');
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const [activeCameraId, setActiveCameraId] = useState<string>('');
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const currentTime = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+
+  useEffect(() => {
+    setActivePresensi(null);
+    setActiveTeachingTeam('');
+    setIsLoading(false);
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) videoRef.current.srcObject = null;
+  }, []);
+
+  useEffect(() => {
+    if (step !== 1) stopCamera();
+    return () => stopCamera();
+  }, [step, stopCamera]);
+
+  useEffect(() => {
+    if (step === 3) {
+      document.getElementById('dashboard-children-container')?.scrollTo(0, 0);
+    }
+  }, [step]);
+
+  const startDecodeLoop = useCallback(async () => {
+    const jsQR = (await import('jsqr')).default;
+
+    const tick = () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
+        animFrameRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'dontInvert',
+      });
+
+      if (code) {
+        stopCamera();
+        setQrToken(code.data);
+        setStep(2);
+        return;
+      }
+
+      animFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    animFrameRef.current = requestAnimationFrame(tick);
+  }, [stopCamera]);
+
+  const startCamera = useCallback(async (deviceId?: string) => {
+    setCameraStatus('requesting');
+    setScanMessage('');
+    stopCamera();
+
+    try {
+      const constraints: MediaStreamConstraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId } }
+          : { facingMode: 'environment' },
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      streamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      setCameras(videoDevices);
+
+      const activeTrack = stream.getVideoTracks()[0];
+      const activeDevice = videoDevices.find(d => d.label === activeTrack.label);
+      if (activeDevice) setActiveCameraId(activeDevice.deviceId);
+
+      setCameraStatus('active');
+      startDecodeLoop();
+    } catch (err: unknown) {
+      const errorName = err instanceof DOMException ? err.name : '';
+      if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
+        setCameraStatus('denied');
+        setScanMessage('Camera permission denied. Enable camera access in browser settings.');
+      } else {
+        setCameraStatus('idle');
+        setScanMessage('Failed to access camera. Please try again.');
+      }
+    }
+  }, [stopCamera, startDecodeLoop]);
+
+  const switchCamera = useCallback(async (deviceId: string) => {
+    setActiveCameraId(deviceId);
+    await startCamera(deviceId);
+  }, [startCamera]);
+
+  const handleScanFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setCameraStatus('scanning');
+    setScanMessage('Analyzing image...');
+
+    const jsQR = (await import('jsqr')).default;
+
+    const img = new window.Image();
+    const url = URL.createObjectURL(file);
+    img.src = url;
+
+    img.onload = () => {
+      const canvas = canvasRef.current ?? document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'attemptBoth',
+      });
+      URL.revokeObjectURL(url);
+
+      if (code) {
+        setCameraStatus('idle');
+        setQrToken(code.data);
+        setStep(2);
+      } else {
+        setCameraStatus('idle');
+        setScanMessage('No QR Code found in this image. Try another image.');
+      }
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      setCameraStatus('idle');
+      setScanMessage('Failed to read image file.');
+    };
+
+    e.target.value = '';
+  }, []);
+
+  const handleConfirmCheckOut = async () => {
+    if (!activePresensi) return;
+
+    setIsSubmitting(true);
+    setSubmitError('');
+    try {
+      const res = await submitCheckOut({
+        id_presensi: activePresensi.id_presensi,
+        deskripsi_materi: materi,
+        qr_token: qrToken,
+      });
+
+      if (res.success) {
+        setStep(3);
+        return;
+      }
+
+      setSubmitError(res.message || 'Check-out failed. Please scan the QR code again and try again.');
+    } catch {
+      setSubmitError('Check-out failed. Please scan the QR code again and try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+
+
+
+  if (isLoading) {
+    return (
+      <AsdosPageShell>
+        <AsdosQrScanSkeleton />
+      </AsdosPageShell>
+    );
+  }
+
+  if (!activePresensi && step !== 3) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[80vh] px-6 text-center">
+        <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 mb-6">
+          <AlertCircle size={40} />
+        </div>
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">No Active Session</h2>
+        <p className="text-slate-500 mb-8 max-w-xs">
+          You have no active QR session today. Make sure you have checked in first.        </p>
+        <Link
+          href="/asdos/check-in"
+          className="bg-crimson text-white font-bold py-3 px-8 rounded-xl shadow-md shadow-crimson/20 hover:bg-[#7a1727] transition-all"
+        >
+          Go to Check-In
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <AsdosPageShell>
+
+      {step === 1 && (
+        <>
+          <AsdosPageHeader eyebrow="Attendance Check-out" title="Scan QR Code" description="Point your camera at the QR code to complete your teaching session." />
+
+          <div className="md:bg-white md:rounded-[2rem] md:shadow-sm md:border md:border-slate-200 md:p-12 lg:p-16 md:flex md:items-start md:gap-16">
+            <div className="hidden md:flex md:flex-1 flex-col justify-center pt-8">
+              <h3 className="text-2xl lg:text-3xl font-extrabold text-[#1F2937] mb-3">Scan QR Code</h3>
+              <p className="text-base text-slate-500 leading-relaxed">
+                Point your camera at the QR code provided by the Coordinator to complete and record today&apos;s teaching session. Make sure there is enough light and the QR code is within the scan area.
+              </p>
+
+              <div className="mt-8 flex flex-row gap-4 w-full">
+                {cameraStatus === 'idle' || cameraStatus === 'denied' ? (
+                  <button
+                    onClick={() => startCamera()}
+                    className="flex-1 flex items-center justify-center gap-2.5 bg-crimson text-white font-bold py-3.5 rounded-xl text-sm shadow-md shadow-crimson/20 active:scale-[0.98] transition-all hover:bg-[#7a1727]"
+                  >
+                    <Camera size={18} />
+                    Enable Camera
+                  </button>
+                ) : cameraStatus === 'requesting' || cameraStatus === 'scanning' || isSubmitting ? (
+                  <button disabled
+                    className="flex-1 flex items-center justify-center gap-2.5 bg-crimson/60 text-white font-bold py-3.5 rounded-xl text-sm cursor-not-allowed">
+                    <Loader2 size={18} className="animate-spin" />
+                    Processing...
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { stopCamera(); setCameraStatus('idle'); }}
+                    className="flex-1 flex items-center justify-center gap-2.5 bg-slate-100 text-slate-700 font-bold py-3.5 rounded-xl text-sm active:scale-[0.98] transition-all hover:bg-slate-200"
+                  >
+                    <RefreshCw size={18} />
+                    Stop Camera
+                  </button>
+                )}
+
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={cameraStatus === 'requesting' || cameraStatus === 'scanning' || isSubmitting}
+                  className="flex-1 flex items-center justify-center gap-2.5 bg-white border-2 border-slate-200 text-slate-700 font-bold py-3 rounded-xl text-sm active:scale-[0.98] transition-all hover:border-slate-300 hover:bg-slate-50 disabled:opacity-40"
+                >
+                  <ImageIcon size={17} />
+                  Scan from File
+                </button>
+              </div>
+
+              {cameras.length > 1 && cameraStatus === 'active' && (
+                <select
+                  value={activeCameraId}
+                  onChange={e => switchCamera(e.target.value)}
+                  className="mt-4 w-full p-3 rounded-xl border-2 border-slate-200 bg-white text-sm font-medium text-slate-700 outline-none focus:border-crimson transition-colors"
+                >
+                  {cameras.map(cam => (
+                    <option key={cam.deviceId} value={cam.deviceId}>
+                      {cam.label || `Camera ${cameras.indexOf(cam) + 1}`}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              {scanMessage && (
+                <div className="mt-4 flex items-center gap-3 text-amber-600 bg-amber-50 px-4 py-3.5 rounded-2xl border border-amber-100 w-full shadow-sm animate-in fade-in duration-300">
+                  <AlertCircle size={18} className="shrink-0" />
+                  <p className="text-[11px] md:text-xs font-medium leading-relaxed">{scanMessage}</p>
+                </div>
+              )}
+
+            </div>
+
+            <div className="md:flex-1 flex flex-col items-center w-full gap-4">
+              <div className="w-full max-w-[280px] md:max-w-[320px] relative group mx-auto">
+                <div className={`w-full aspect-square flex flex-col items-center justify-center text-slate-300 bg-slate-50 rounded-2xl border border-slate-200 shadow-inner
+                  ${cameraStatus === 'active' ? 'opacity-0' : 'opacity-100'} transition-opacity`}>
+                  {cameraStatus === 'requesting' || cameraStatus === 'scanning' || isSubmitting ? (
+                    <Loader2 size={48} className="opacity-60 animate-spin mb-3 text-crimson" />
+                  ) : cameraStatus === 'denied' ? (
+                    <AlertCircle size={48} className="opacity-60 mb-3 text-amber-400" />
+                  ) : (
+                    <Scan size={48} className="opacity-50 animate-pulse mb-3" />
+                  )}
+                  <p className="text-xs font-semibold text-center px-4">
+                    {cameraStatus === 'requesting' ? 'Requesting camera access...' :
+                      cameraStatus === 'scanning' ? 'Analyzing image...' :
+                        cameraStatus === 'denied' ? 'Camera access denied' :
+                          'QR Scan Area'}
+                  </p>
+                </div>
+
+                <video
+                  ref={videoRef}
+                  playsInline
+                  muted
+                  className={`absolute top-0 left-0 w-full aspect-square object-cover rounded-2xl
+                    ${cameraStatus === 'active' ? 'opacity-100' : 'opacity-0'} transition-opacity duration-300`}
+                />
+
+                <canvas ref={canvasRef} className="hidden" />
+
+                <div className="absolute top-0 left-0 w-full aspect-square pointer-events-none z-20">
+                  <div className="absolute -top-3 -left-3 w-12 h-12 border-t-4 border-l-4 border-crimson rounded-tl-2xl transition-all duration-300 group-hover:-translate-x-1 group-hover:-translate-y-1" />
+                  <div className="absolute -top-3 -right-3 w-12 h-12 border-t-4 border-r-4 border-crimson rounded-tr-2xl transition-all duration-300 group-hover:translate-x-1 group-hover:-translate-y-1" />
+                  <div className="absolute -bottom-3 -left-3 w-12 h-12 border-b-4 border-l-4 border-crimson rounded-bl-2xl transition-all duration-300 group-hover:-translate-x-1 group-hover:translate-y-1" />
+                  <div className="absolute -bottom-3 -right-3 w-12 h-12 border-b-4 border-r-4 border-crimson rounded-br-2xl transition-all duration-300 group-hover:translate-x-1 group-hover:translate-y-1" />
+                </div>
+
+                {cameraStatus === 'active' && (
+                  <div className="absolute top-0 left-0 w-full aspect-square rounded-2xl overflow-hidden pointer-events-none z-10">
+                    <div className="absolute left-0 w-full h-0.5 bg-crimson/60 shadow-[0_0_8px_var(--color-crimson)]"
+                      style={{ animation: 'scanLine 2s linear infinite' }} />
+                  </div>
+                )}
+              </div>
+
+              <div className="w-full max-w-[280px] md:max-w-[320px] flex md:hidden flex-col gap-3 mt-2">
+                {cameraStatus === 'idle' || cameraStatus === 'denied' ? (
+                  <button
+                    onClick={() => startCamera()}
+                    className="w-full flex items-center justify-center gap-2.5 bg-crimson text-white font-bold py-3.5 rounded-xl text-sm shadow-md shadow-crimson/20 active:scale-[0.98] transition-all hover:bg-[#7a1727]"
+                  >
+                    <Camera size={18} />
+                    Enable Camera
+                  </button>
+                ) : cameraStatus === 'requesting' || cameraStatus === 'scanning' || isSubmitting ? (
+                  <button disabled
+                    className="w-full flex items-center justify-center gap-2.5 bg-crimson/60 text-white font-bold py-3.5 rounded-xl text-sm cursor-not-allowed">
+                    <Loader2 size={18} className="animate-spin" />
+                    Processing...
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { stopCamera(); setCameraStatus('idle'); }}
+                    className="w-full flex items-center justify-center gap-2.5 bg-slate-100 text-slate-700 font-bold py-3.5 rounded-xl text-sm active:scale-[0.98] transition-all hover:bg-slate-200"
+                  >
+                    <RefreshCw size={18} />
+                    Stop Camera
+                  </button>
+                )}
+
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={cameraStatus === 'requesting' || cameraStatus === 'scanning' || isSubmitting}
+                  className="w-full flex items-center justify-center gap-2.5 bg-white border-2 border-slate-200 text-slate-700 font-bold py-3 rounded-xl text-sm active:scale-[0.98] transition-all hover:border-slate-300 hover:bg-slate-50 disabled:opacity-40"
+                >
+                  <ImageIcon size={17} />
+                  Scan from Image File
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handleScanFile}
+                />
+
+                {cameras.length > 1 && cameraStatus === 'active' && (
+                  <select
+                    value={activeCameraId}
+                    onChange={e => switchCamera(e.target.value)}
+                    className="w-full p-3 rounded-xl border-2 border-slate-200 bg-white text-sm font-medium text-slate-700 outline-none focus:border-crimson transition-colors"
+                  >
+                    {cameras.map(cam => (
+                      <option key={cam.deviceId} value={cam.deviceId}>
+                        {cam.label || `Camera ${cameras.indexOf(cam) + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {scanMessage && (
+                  <div className="flex items-center gap-3 text-amber-600 bg-amber-50 px-4 py-3.5 rounded-2xl border border-amber-100 w-full shadow-sm animate-in fade-in duration-300">
+                    <AlertCircle size={18} className="shrink-0" />
+                    <p className="text-[11px] md:text-xs font-medium leading-relaxed">{scanMessage}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {step === 2 && activePresensi && (() => {
+        const checkInMs = new Date(activePresensi.waktu_checkin).getTime();
+        const availableAt = new Date(checkInMs + 60 * 60 * 1000);
+        const isCheckoutAvailable = new Date() >= availableAt;
+        const availableAtStr = availableAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+
+        return (
+        <>
+          <div className="mb-6 md:mb-8 flex items-center justify-between">
+            <div>
+              <p className="text-[11px] font-bold text-crimson tracking-[0.15em] uppercase md:text-xs">Attendance Check-out</p>
+              <h2 className="text-[22px] md:text-3xl leading-7 md:leading-8 font-extrabold text-[#1F2937]">Fill Material Report</h2>
+            </div>
+            <button
+              onClick={() => setStep(1)}
+              className="shrink-0 w-9 h-9 md:w-10 md:h-10 flex items-center justify-center bg-white border border-slate-200 text-slate-500 rounded-2xl active:scale-95 transition-all hover:bg-slate-50 shadow-sm"
+            >
+              <ArrowLeft size={18} />
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-6">
+            <div className="bg-white rounded-[12px] md:rounded-[24px] p-5 md:p-6 border border-slate-100 shadow-[0_4px_24px_rgba(0,0,0,0.04)]">
+              <article className="flex flex-col md:flex-row md:items-center gap-4 md:gap-6">
+                <div className="flex flex-col gap-0.5 min-w-0 md:w-1/3">
+                  <h3 className="text-base md:text-lg font-bold text-slate-900 leading-snug">{activePresensi.nama_mata_kuliah}</h3>
+                  <p className="text-xs text-slate-500 font-medium">{activePresensi.nama_kelas}</p>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 flex-1">
+                  <div className="flex flex-col gap-0.5 border-l-2 border-slate-100 pl-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Date</span>
+                    <span className="text-xs md:text-sm font-bold text-slate-800">
+                      {new Date(activePresensi.tanggal_mengajar).toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' })}
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-0.5 border-l-2 border-slate-100 pl-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Check-in</span>
+                    <span className="text-xs md:text-sm font-bold text-slate-800">
+                      {parseUTC(activePresensi.waktu_checkin).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} WIB
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-0.5 border-l-2 border-slate-100 pl-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Room</span>
+                    <span className="text-xs md:text-sm font-bold text-slate-800">{activePresensi.nama_ruangan}</span>
+                  </div>
+                  <div className="flex flex-col gap-0.5 border-l-2 border-slate-100 pl-3">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Teaching Assistant</span>
+                    <div className="flex flex-col gap-0.5">
+                      {(activeTeachingTeam || formatTeachingTeam(activePresensi)).split(' & ').map((name, i) => (
+                        <span key={i} className="text-xs md:text-sm font-bold text-slate-800 leading-snug">{name}</span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+
+            <section className="bg-white rounded-[12px] md:rounded-[32px] p-6 md:p-8 shadow-[0_4px_24px_rgba(0,0,0,0.04)] border border-slate-100 flex flex-col gap-5 w-full">
+              <div className="flex items-center gap-2">
+                <BookOpen className="w-[18px] h-[18px] text-slate-800" strokeWidth={2.5} />
+                <span className="text-sm md:text-base font-bold text-slate-800">Teaching Material</span>
+              </div>
+
+              <div className="relative">
+                <textarea
+                  value={materi}
+                  onChange={e => {
+                    const val = e.target.value;
+                    if (val.length <= MAX_HURUF) setMateri(val);
+                  }}
+                  disabled={!isCheckoutAvailable}
+                  placeholder={isCheckoutAvailable ? "Type the material covered in this session..." : "Available after 1 hour of teaching..."}
+                  className="w-full bg-fog rounded-[14px] p-4 md:p-5 pb-8 text-sm md:text-base text-slate-700 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-crimson/30 transition-all resize-none h-24 md:h-32 border-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                <div className={`absolute bottom-3 right-4 text-[10px] font-medium bg-fog/80 px-1 ${materi.length >= MAX_HURUF ? 'text-crimson' : 'text-slate-400'}`}>
+                  {materi.length} / {MAX_HURUF} chars
+                </div>
+              </div>
+
+              <p className="text-[10px] md:text-xs text-crimson font-medium leading-relaxed">
+                * Please fill in the teaching material clearly. If teaching with a partner, make sure both of you enter the same material.
+              </p>
+
+              {!isCheckoutAvailable && (
+                <div className="flex items-center gap-2.5 bg-amber-50 border border-amber-100 rounded-2xl px-4 py-3">
+                  <AlertCircle size={15} className="text-amber-500 shrink-0" />
+                  <p className="text-[11px] md:text-xs text-amber-700 font-medium leading-relaxed">
+                    Check-out available from <span className="font-bold">{availableAtStr}</span> — at least 1 hour after check-in.
+                  </p>
+                </div>
+              )}
+
+              <div className="pt-2 border-t border-slate-100">
+                {submitError && (
+                  <div className="mb-4 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-[11px] md:text-xs font-semibold text-amber-700 leading-relaxed">
+                    {submitError}
+                  </div>
+                )}
+                {isConfirmOpen ? (
+                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                    <div>
+                      <p className="text-base font-bold text-slate-800">Are you sure?</p>
+                      <p className="text-sm text-slate-400 mt-0.5">Check-out will be recorded immediately.</p>
+                    </div>
+                    <div className="grid grid-cols-2 sm:flex gap-3 md:shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setIsConfirmOpen(false)}
+                        disabled={isSubmitting}
+                        className="px-6 py-3 rounded-[14px] bg-white border border-slate-200 text-slate-600 font-bold text-sm active:scale-[0.98] transition-all hover:bg-slate-50 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmCheckOut}
+                        disabled={isSubmitting}
+                        className="px-6 py-3 rounded-[14px] bg-crimson text-white font-bold text-sm shadow-md shadow-crimson/20 active:scale-[0.98] transition-all hover:bg-[#7a1727] disabled:opacity-50 flex items-center justify-center gap-2"
+                      >
+                        {isSubmitting && <Loader2 size={16} className="animate-spin" />}
+                        Yes, Check-out
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="md:flex md:justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setIsConfirmOpen(true)}
+                      disabled={!materi.trim() || !isCheckoutAvailable}
+                      className="w-full md:w-auto bg-crimson text-white font-bold py-4 md:py-3.5 md:px-10 text-[15px] rounded-[14px] shadow-md shadow-crimson/20 active:scale-[0.98] transition-all disabled:opacity-50 hover:bg-[#7a1727]"
+                    >
+                      Check-out Now
+                    </button>
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+        </>
+        );
+      })()}
+
+      {step === 3 && activePresensi && (
+        <>
+          <div className="mb-6 md:mb-8 text-center md:text-left">
+            <p className="text-[11px] font-bold text-crimson tracking-[0.15em] uppercase mb-1 md:text-xs">Attendance Check-out</p>
+            <h2 className="text-[28px] md:text-3xl leading-8 font-extrabold text-[#1F2937]">Session Complete!</h2>
+            <p className="text-sm text-slate-500 mt-1 md:text-base">Your teaching session has been completed and recorded.</p>
+          </div>
+
+          <div className="md:bg-white md:rounded-[2rem] md:shadow-sm md:border md:border-slate-200 md:p-12 lg:p-16 md:flex md:items-center md:gap-16">
+            <div className="flex justify-center md:flex-1 mb-10 md:mb-0">
+              <div className="relative flex items-center justify-center">
+                <div className="absolute w-36 h-36 md:w-48 md:h-48 bg-crimson/5 rounded-full animate-ping" />
+                <div className="absolute w-28 h-28 md:w-36 md:h-36 bg-crimson/8 rounded-full" />
+                <div className="relative w-20 h-20 md:w-24 md:h-24 bg-crimson rounded-full flex items-center justify-center text-white shadow-xl shadow-crimson/30">
+                  <Check size={36} strokeWidth={3} />
+                </div>
+              </div>
+            </div>
+            <div className="md:flex-1">
+              <div className="bg-white rounded-3xl border border-slate-100 md:border-slate-200 overflow-hidden shadow-[0_4px_20px_rgba(0,0,0,0.03)] md:shadow-md">
+                <div className="h-1 bg-crimson" />
+                <div className="p-6 md:p-7 text-center">
+                  <p className="text-[10px] md:text-xs font-bold text-slate-400 tracking-widest uppercase mb-1">Completed Session Details</p>
+                  <h3 className="text-lg md:text-xl font-bold text-slate-800 mb-6 leading-snug">
+                    {activePresensi.nama_mata_kuliah}
+                    <span className="block text-sm font-medium text-slate-400 mt-0.5">{activePresensi.nama_ruangan} · {activePresensi.nama_kelas}</span>
+                  </h3>
+
+                  <div className="flex gap-4 border-t border-slate-100 pt-5 pb-5">
+                    <div className="flex-1">
+                      <p className="text-[10px] md:text-xs font-bold text-slate-400 tracking-widest uppercase mb-1">Check-in</p>
+                      <p className="text-base md:text-lg font-extrabold text-slate-600">
+                        {parseUTC(activePresensi.waktu_checkin).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} WIB
+                      </p>
+                    </div>
+                    <div className="w-px bg-slate-100" />
+                    <div className="flex-1">
+                      <p className="text-[10px] md:text-xs font-bold text-slate-400 tracking-widest uppercase mb-1">Check-out</p>
+                      <p className="text-base md:text-lg font-extrabold text-crimson">{currentTime} WIB</p>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] md:text-sm text-slate-500 leading-relaxed border-t border-slate-100 pt-5">
+                    Thank you for teaching today. You can view the details in the <span className="font-bold text-slate-700">History</span> menu.
+                  </p>
+                </div>
+              </div>
+              <Link
+                href="/asdos"
+                className="mt-4 w-full bg-crimson text-white font-bold py-4 md:text-[15px] rounded-xl md:rounded-2xl shadow-md shadow-crimson/20 active:scale-[0.98] transition-all hover:bg-[#7a1727] flex items-center justify-center"
+              >
+                Back to Home
+              </Link>
+            </div>
+          </div>
+        </>
+      )}
+
+      <style>{`
+        @keyframes scanLine {
+          0%   { top: 8%; }
+          50%  { top: 88%; }
+          100% { top: 8%; }
+        }
+      `}</style>
+    </AsdosPageShell>
+  );
+}

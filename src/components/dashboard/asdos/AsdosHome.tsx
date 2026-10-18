@@ -1,0 +1,732 @@
+'use client';
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
+import {
+  ScanLine,
+  FileSignature,
+  Monitor,
+  History,
+  CalendarDays,
+  CalendarSync,
+  CheckCircle2,
+  Bell,
+  ChevronRight,
+} from 'lucide-react';
+import { getSessionsByDate, type SessionFromAPI } from '@/lib/actions/jadwal';
+import { getMySubstitutions } from '@/lib/actions/pergantian-kelas';
+import { getMyPresensi, type PresensiResponseDTO } from '@/lib/actions/presensi';
+import { getSessionPresensiMode, isOnlinePresensi, isQrPresensi } from '@/lib/presensi-mode';
+import { useNotificationStore } from '@/store/useNotificationStore';
+import { useUserStore } from '@/store/useUserStore';
+import type { SubstituteSessionDetail } from '@/types/api';
+
+export const asdosMenuItems = [
+  {
+    id: 1,
+    title: 'Class Check-in',
+    icon: ScanLine,
+    href: '/asdos/check-in',
+    desc: 'Mark attendance check-in',
+  },
+  {
+    id: 2,
+    title: 'Class Check-out',
+    icon: FileSignature,
+    href: '/asdos/check-out',
+    desc: 'Mark attendance check-out',
+  },
+  {
+    id: 3,
+    title: 'Online Attendance',
+    icon: Monitor,
+    href: '/asdos/presensi-kelas-online',
+    desc: 'Attendance via online class',
+  },
+  {
+    id: 4,
+    title: 'Attendance History',
+    icon: History,
+    href: '/asdos/riwayat-kehadiran',
+    desc: 'View attendance history',
+  },
+  {
+    id: 5,
+    title: 'Teaching Schedule',
+    icon: CalendarDays,
+    href: '/asdos/jadwal-ajar',
+    desc: 'View teaching schedule',
+  },
+  {
+    id: 6,
+    title: 'Substitute Class',
+    icon: CalendarSync,
+    href: '/asdos/pengajuan-kp',
+    desc: 'Submit substitute class',
+  },
+];
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatShortDate(dateStr: string) {
+  try {
+    return new Date(dateStr).toLocaleDateString('en-US', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+    });
+  } catch {
+    return dateStr;
+  }
+}
+
+function getScheduleTypeLabel(schedule: SessionFromAPI) {
+  return schedule.tipe_jadwal === 'PENGGANTI' ? 'PENGGANTI' : 'REGULER';
+}
+
+function getScheduleStartMinutes(schedule: SessionFromAPI) {
+  const match = schedule.waktu.match(/(\d{1,2})[:.](\d{2})/);
+  if (!match) return 0;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return 0;
+  return hour * 60 + minute;
+}
+
+function getScheduleEndMinutes(schedule: SessionFromAPI) {
+  const matches = [...schedule.waktu.matchAll(/(\d{1,2})[:.](\d{2})/g)];
+  const end = matches[matches.length - 1];
+  if (!end) return Number.POSITIVE_INFINITY;
+  const hour = Number(end[1]);
+  const minute = Number(end[2]);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return Number.POSITIVE_INFINITY;
+  return hour * 60 + minute;
+}
+
+function getCurrentMinutes() {
+  const now = new Date();
+  return now.getHours() * 60 + now.getMinutes();
+}
+
+function getKpStatusClass(status: SubstituteSessionDetail['status']) {
+  if (status === 'PENDING') return 'bg-fog text-ink';
+  if (status === 'VERIFIED') return 'bg-emerald-50 text-emerald-700 border border-emerald-100';
+  return 'bg-rose-50 text-rose-700 border border-rose-100';
+}
+
+function getKpStatusLabel(status: SubstituteSessionDetail['status']) {
+  if (status === 'PENDING') return 'PENDING';
+  if (status === 'VERIFIED') return 'APPROVED';
+  return 'REJECTED';
+}
+
+function getDisplayName(email?: string | null) {
+  if (!email) return 'Teaching Assistant';
+
+  const raw = email.split('@')[0] || '';
+  const cleaned = raw
+    .replace(/[._-]+/g, ' ')
+    .replace(/\d+/g, ' ')
+    .trim();
+
+  if (!cleaned) return 'Teaching Assistant';
+
+  return cleaned
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function hasMeaningfulText(value?: string | null) {
+  const text = String(value ?? '').trim();
+  return text !== '' && text !== '-';
+}
+
+type ActivityItem = {
+  id: string;
+  title: string;
+  detail: string;
+  date: string;
+  badge: string;
+  tone: 'emerald' | 'blue';
+};
+
+type PresensiActivityItem = {
+  id: string;
+  nama_mata_kuliah: string;
+  nama_kelas: string;
+  nama_ruangan: string;
+  tanggal_mengajar: string;
+  isVerified: boolean;
+  isPaid: boolean;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function AsdosHomeSkeleton() {
+  return (
+    <div className="max-w-6xl mx-auto px-1.5 sm:px-2 md:px-0 pb-10 md:pb-12">
+      <div className="mb-6 md:mb-8 space-y-2.5">
+        <div className="h-3 w-32 rounded-lg animate-shimmer" />
+        <div className="h-8 w-48 rounded-xl animate-shimmer" />
+        <div className="h-4 w-full max-w-xl rounded-lg animate-shimmer" />
+      </div>
+
+      <div className="grid grid-cols-4 lg:hidden gap-y-6 gap-x-3 mb-8">
+        {Array.from({ length: 6 }, (_, i) => (
+          <div key={i} className="flex flex-col items-center gap-3">
+            <div className="w-14 h-14 rounded-full animate-shimmer" />
+            <div className="h-3 w-14 rounded-lg animate-shimmer" />
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1.08fr_0.92fr] gap-8">
+        <section className="lg:row-span-2">
+          <div className="flex items-center justify-between mb-4 lg:mb-6 px-1">
+            <div className="h-6 w-36 rounded-xl animate-shimmer" />
+            <div className="h-4 w-20 rounded-lg animate-shimmer" />
+          </div>
+          <div className="bg-white rounded-2xl p-4 lg:p-5 space-y-4 border border-slate-100 lg:min-h-[430px]">
+            {Array.from({ length: 3 }, (_, i) => (
+              <div key={i} className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 space-y-4">
+                <div className="flex justify-between gap-4">
+                  <div className="space-y-2 flex-1">
+                    <div className="h-5 w-44 rounded-lg animate-shimmer" />
+                    <div className="h-3.5 w-28 rounded-lg animate-shimmer" />
+                  </div>
+                  <div className="h-6 w-20 rounded-full animate-shimmer" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="h-4 w-24 rounded-lg animate-shimmer" />
+                  <div className="h-4 w-24 rounded-lg animate-shimmer" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {Array.from({ length: 2 }, (_, section) => (
+          <section key={section}>
+            <div className="flex items-center justify-between mb-4 lg:mb-6 px-1">
+              <div className="h-6 w-44 rounded-xl animate-shimmer" />
+              <div className="h-4 w-20 rounded-lg animate-shimmer" />
+            </div>
+            <div className="bg-white rounded-2xl p-4 lg:p-5 space-y-3 border border-slate-100">
+              {Array.from({ length: 3 }, (_, i) => (
+                <div key={i} className="rounded-2xl border border-slate-100 bg-slate-50/70 p-4 space-y-2">
+                  <div className="h-4 w-2/3 rounded-lg animate-shimmer" />
+                  <div className="h-3.5 w-1/2 rounded-lg animate-shimmer" />
+                </div>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default function AsdosHome() {
+  const { markSeen, setPendingCount } = useNotificationStore();
+  const user = useUserStore((state) => state.user);
+  const [sessionsToday, setSessionsToday] = useState<SessionFromAPI[]>([]);
+  const [presensiItems, setPresensiItems] = useState<PresensiResponseDTO[]>([]);
+  const [kpItems, setKpItems] = useState<SubstituteSessionDetail[]>([]);
+  const [kpItem, setKpItem] = useState<SubstituteSessionDetail | null>(null);
+  const [presensiItem, setPresensiItem] = useState<PresensiResponseDTO | null>(null);
+  const [isSessionsLoading, setIsSessionsLoading] = useState(true);
+  const [isKpLoading, setIsKpLoading] = useState(true);
+  const [isPresensiLoading, setIsPresensiLoading] = useState(true);
+  const [currentMinutes, setCurrentMinutes] = useState(getCurrentMinutes);
+  const fetchingRef = useRef(false);
+
+  useEffect(() => {
+    const interval = setInterval(() => setCurrentMinutes(getCurrentMinutes()), 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (fetchingRef.current) return;
+    fetchingRef.current = true;
+    let cancelled = false;
+
+    const date = todayISO();
+
+    getSessionsByDate(date)
+      .then((res) => {
+        if (cancelled) return;
+        setSessionsToday(res.success && res.data ? res.data : []);
+        setIsSessionsLoading(false);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch sessions:", err);
+        if (!cancelled) setIsSessionsLoading(false);
+      });
+
+    getMySubstitutions()
+      .then((res) => {
+        if (cancelled) return;
+        const substitutions = res.success && res.data?.items ? res.data.items : [];
+        setKpItems(substitutions);
+
+        const { lastSeenKpId, setLastSeenKpId } = useNotificationStore.getState();
+        const recentKp = substitutions
+          .filter((item) => item.status === 'VERIFIED' || item.status === 'REJECTED')
+          .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())[0] ?? null;
+
+        const kpToShow = recentKp && recentKp.id !== lastSeenKpId ? recentKp : null;
+        setKpItem(kpToShow);
+        if (recentKp) setLastSeenKpId(recentKp.id);
+        setIsKpLoading(false);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch substitutions:", err);
+        if (!cancelled) setIsKpLoading(false);
+      });
+
+    getMyPresensi()
+      .then((res) => {
+        if (cancelled) return;
+        const presensi = res.success && res.data ? res.data : [];
+        setPresensiItems(presensi);
+
+        const { lastSeenPresensiId, setLastSeenPresensiId } = useNotificationStore.getState();
+        const verifiedToday = presensi
+          .filter((p) => p.is_verified && String(p.tanggal_mengajar).split('T')[0] === date)
+          .sort((a, b) => new Date(b.waktu_checkin || b.tanggal_mengajar).getTime() - new Date(a.waktu_checkin || a.tanggal_mengajar).getTime())[0] ?? null;
+
+        const presensiToShow = verifiedToday && verifiedToday.id_presensi !== lastSeenPresensiId ? verifiedToday : null;
+        setPresensiItem(presensiToShow);
+        if (verifiedToday) setLastSeenPresensiId(verifiedToday.id_presensi);
+        setIsPresensiLoading(false);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch presensi:", err);
+        if (!cancelled) setIsPresensiLoading(false);
+      });
+
+    fetchingRef.current = false;
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    setPendingCount((kpItem ? 1 : 0) + (presensiItem ? 1 : 0));
+  }, [kpItem, presensiItem, setPendingCount]);
+
+  useEffect(() => {
+    if (!isKpLoading && !isPresensiLoading) {
+      markSeen();
+    }
+  }, [isKpLoading, isPresensiLoading, markSeen]);
+
+  const displayName = user?.username || getDisplayName(user?.email);
+
+  const presensiActivities = useMemo<PresensiActivityItem[]>(() => {
+    return [...presensiItems]
+      .filter((item) => hasMeaningfulText(item.nama_mata_kuliah) || hasMeaningfulText(item.nama_kelas))
+      .sort((a, b) => new Date(b.waktu_checkin || b.tanggal_mengajar).getTime() - new Date(a.waktu_checkin || a.tanggal_mengajar).getTime())
+      .map((item) => ({
+        id: item.id_presensi,
+        nama_mata_kuliah: item.nama_mata_kuliah,
+        nama_kelas: item.nama_kelas,
+        nama_ruangan: item.nama_ruangan,
+        tanggal_mengajar: item.tanggal_mengajar,
+        isVerified: item.is_verified,
+        isPaid: item.is_paid,
+      }));
+  }, [presensiItems]);
+
+  const activityItems = useMemo<ActivityItem[]>(() => {
+    const items: ActivityItem[] = [];
+
+    for (const item of presensiActivities) {
+      const subject = item.nama_mata_kuliah;
+      const context = `${item.nama_kelas} - ${item.nama_ruangan}`;
+
+      if (item.isVerified) {
+        items.push({
+          id: `${item.id}-verified`,
+          title: 'Attendance verified',
+          detail: `${subject} • ${context}`,
+          date: item.tanggal_mengajar,
+          badge: 'Verified',
+          tone: 'emerald',
+        });
+      }
+
+      if (item.isPaid) {
+        items.push({
+          id: `${item.id}-paid`,
+          title: 'Payment received',
+          detail: `${subject} • ${context}`,
+          date: item.tanggal_mengajar,
+          badge: 'Paid',
+          tone: 'blue',
+        });
+      }
+    }
+
+    return items.slice(0, 3);
+  }, [presensiActivities]);
+
+  const activityRows = activityItems.slice(0, 3);
+
+  const { currentSchedules, pastSchedules } = useMemo(() => {
+    const nowMinutes = getCurrentMinutes();
+    return {
+      currentSchedules: sessionsToday.filter((schedule) => getScheduleEndMinutes(schedule) >= nowMinutes),
+      pastSchedules: sessionsToday.filter((schedule) => getScheduleEndMinutes(schedule) < nowMinutes),
+    };
+  }, [sessionsToday]);
+
+  const recentKpItems = useMemo(() => {
+    return [...kpItems]
+      .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+      .slice(0, 3);
+  }, [kpItems]);
+
+  const renderScheduleCard = (schedule: SessionFromAPI, showActions: boolean) => {
+    const today = todayISO();
+    const startMinutes = getScheduleStartMinutes(schedule);
+    const canCheckIn = currentMinutes >= startMinutes - 10;
+    const presensiMode = getSessionPresensiMode(schedule);
+    const isQrMode = presensiMode === 'qr';
+    const canFillOnlineAttendance = currentMinutes >= startMinutes - 15;
+
+    const sessionPresensi = presensiItems.find(p => {
+      const matchDate = String(p.tanggal_mengajar).split('T')[0] === today;
+      return matchDate && (p.id_sesi === schedule.id_sesi || p.id_sesi_pengganti === schedule.id_sesi);
+    });
+    const hasCheckedIn = !!sessionPresensi;
+    const hasCheckedOut = hasCheckedIn && !!sessionPresensi!.waktu_checkout && !String(sessionPresensi!.waktu_checkout).startsWith('0001');
+    const hasSubmittedOnline = !!sessionPresensi && isOnlinePresensi(sessionPresensi);
+
+    return (
+      <div key={`${schedule.id_sesi}-${schedule.waktu}`} className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 transition-all duration-200 hover:bg-white hover:shadow-sm">
+        <div className="flex justify-between gap-3 items-start">
+          <div className="min-w-0">
+            <h4 className="text-sm lg:text-base font-extrabold text-slate-800 leading-tight truncate">{schedule.mata_kuliah}</h4>
+            <p className="text-xs text-slate-500 leading-tight mt-1 truncate">
+              {schedule.nama_kelas}
+            </p>
+          </div>
+          {getScheduleTypeLabel(schedule) === 'PENGGANTI' && (
+            <span className="rounded-full bg-crimson/5 px-3 py-1 text-[10px] font-extrabold text-crimson shrink-0">
+              PENGGANTI
+            </span>
+          )}
+        </div>
+        <div className="mt-4 flex flex-col gap-1.5 text-xs text-slate-700">
+          <p>
+            <span className="font-bold text-slate-500">Time: </span>
+            <span className="font-semibold">{schedule.waktu.split(', ').pop() ?? schedule.waktu}</span>
+          </p>
+          <p className="truncate">
+            <span className="font-bold text-slate-500">Room: </span>
+            <span className="font-semibold">{schedule.ruangan}</span>
+          </p>
+        </div>
+        {showActions && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {isQrMode ? (
+              hasCheckedOut ? (
+                <span className="inline-flex items-center justify-center rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-500 border border-slate-200">
+                  Attendance done
+                </span>
+              ) : hasCheckedIn ? (
+                <span className="inline-flex items-center justify-center rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-500 border border-slate-200">
+                  Checked in
+                </span>
+              ) : (
+                canCheckIn ? (
+                  <Link href="/asdos/check-in" className="inline-flex items-center justify-center rounded-xl bg-crimson px-4 py-2 text-xs font-bold text-white shadow-sm shadow-crimson/20 active:scale-[0.98]">
+                    Check-in
+                  </Link>
+                ) : (
+                  <span className="inline-flex items-center justify-center rounded-xl bg-crimson/40 px-4 py-2 text-xs font-bold text-white cursor-not-allowed select-none">
+                    Check-in
+                  </span>
+                )
+              )
+            ) : hasSubmittedOnline ? (
+              <span className="inline-flex items-center justify-center rounded-xl bg-slate-100 px-4 py-2 text-xs font-bold text-slate-500 border border-slate-200">
+                Attendance done
+              </span>
+            ) : !canFillOnlineAttendance ? (
+              <span className="inline-flex items-center justify-center rounded-xl bg-crimson/40 px-4 py-2 text-xs font-bold text-white cursor-not-allowed select-none">
+                Submit Online Attendance
+              </span>
+            ) : (
+              <Link href="/asdos/presensi-kelas-online" className="inline-flex items-center justify-center rounded-xl bg-crimson px-4 py-2 text-xs font-bold text-white shadow-sm shadow-crimson/20 active:scale-[0.98]">
+                Submit Online Attendance
+              </Link>
+            )}
+            {isQrMode && sessionPresensi && isQrPresensi(sessionPresensi) && hasCheckedIn && !hasCheckedOut && (
+              <Link href="/asdos/check-out" className="inline-flex items-center justify-center rounded-xl bg-crimson px-4 py-2 text-xs font-bold text-white shadow-sm shadow-crimson/20 active:scale-[0.98]">
+                Check-out
+              </Link>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const showNotification = (!isKpLoading && kpItem) || (!isPresensiLoading && presensiItem);
+
+  return (
+    <div className="max-w-6xl mx-auto px-1.5 sm:px-2 md:px-0 pb-10 md:pb-12">
+      <div className="mb-6 md:mb-8 animate-fade-up">
+        <p className="text-[11px] font-bold text-crimson tracking-[0.15em] uppercase mb-1 md:text-xs">
+          Teaching Assistant Dashboard
+        </p>
+        <h1 className="text-[24px] md:text-[30px] font-extrabold text-slate-900 leading-tight">
+          Hello, {displayName}
+        </h1>
+        <p className="text-xs md:text-sm text-slate-700 mt-2 max-w-2xl">
+          Track your teaching schedule, attendance status, and substitute class submissions here.
+        </p>
+      </div>
+
+      {showNotification && (
+        <div className="mb-8 animate-fade-up" style={{ animationDelay: '0.05s' }}>
+          <div className="flex items-center gap-2 mb-4 px-1">
+            <div className="relative">
+              <Bell size={16} className="text-crimson" />
+              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-crimson" />
+            </div>
+            <h3 className="font-bold text-lg text-slate-800">Notifikasi</h3>
+          </div>
+          <div className="space-y-3">
+            {kpItem && !isKpLoading && (
+              <div className="bg-white p-4 rounded-2xl shadow-md lg:shadow-sm flex items-center gap-4 border border-slate-100">
+                <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${kpItem.status === 'VERIFIED' ? 'bg-emerald-50 text-emerald-500' : 'bg-red-50 text-red-500'}`}>
+                  <CheckCircle2 size={20} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-bold text-slate-800 truncate">
+                    {kpItem.status === 'VERIFIED' ? 'Substitute Request Approved' : 'Substitute Request Rejected'}
+                  </p>
+                  <p className="text-xs text-slate-700 mt-0.5 line-clamp-1">
+                    {kpItem.session?.mata_kuliah ?? 'Substitute class'} {kpItem.session?.nama_kelas ?? ''} has been {kpItem.status === 'VERIFIED' ? 'approved' : 'rejected'} by coordinator
+                  </p>
+                </div>
+                <Link href="/asdos/pengajuan-kp" className="hidden sm:flex items-center gap-1 text-xs font-bold text-crimson shrink-0 hover:underline">
+                  Detail <ChevronRight size={13} />
+                </Link>
+              </div>
+            )}
+            {presensiItem && !isPresensiLoading && (
+              <div className="bg-white p-4 rounded-2xl shadow-md lg:shadow-sm flex items-center gap-4 border border-slate-100">
+                <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-500 shrink-0">
+                  <CalendarSync size={20} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-bold text-slate-800 truncate">Attendance Verified</p>
+                  <p className="text-xs text-slate-700 mt-0.5 line-clamp-1">
+                    {presensiItem.nama_mata_kuliah} {presensiItem.nama_kelas} attendance has been verified by coordinator
+                  </p>
+                </div>
+                <Link href="/asdos/riwayat-kehadiran" className="hidden sm:flex items-center gap-1 text-xs font-bold text-crimson shrink-0 hover:underline">
+                  Detail <ChevronRight size={13} />
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-4 lg:hidden gap-y-6 gap-x-3 mb-8 w-full">
+        {asdosMenuItems.map((item) => {
+          const Icon = item.icon;
+          return (
+            <Link key={item.id} href={item.href} className="flex flex-col items-center group">
+              <div className="w-14 h-14 bg-white rounded-full flex items-center justify-center shadow-[0_4px_20px_rgba(0,0,0,0.03)] text-crimson group-hover:scale-105 group-active:scale-95 transition-all mb-3">
+                <Icon size={24} strokeWidth={2} />
+              </div>
+              <span className="text-[10px] font-semibold text-slate-800 text-center w-16 leading-tight">
+                {item.title}
+              </span>
+            </Link>
+          );
+        })}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1.08fr_0.92fr] gap-8 lg:gap-8">
+        <div className="animate-fade-up lg:row-span-2 flex flex-col" style={{ animationDelay: '0.1s' }}>
+          <div className="flex justify-between items-center mb-4 lg:mb-6 px-1">
+            <h3 className="font-bold text-lg lg:text-xl text-slate-800">Today&apos;s Schedule</h3>
+            <Link href="/asdos/jadwal-ajar" className="text-xs lg:text-sm font-semibold text-crimson active:scale-95 transition">
+              View All
+            </Link>
+          </div>
+          <div className="bg-white rounded-2xl shadow-md lg:shadow-sm p-4 lg:p-5 space-y-4 border border-slate-100 flex-1">
+            {isSessionsLoading ? (
+              <div className="space-y-4">
+                {Array.from({ length: 2 }, (_, i) => (
+                  <div key={i} className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 space-y-4">
+                    <div className="flex justify-between gap-4">
+                      <div className="space-y-2 flex-1">
+                        <div className="h-5 w-44 rounded-lg animate-shimmer" />
+                        <div className="h-3.5 w-28 rounded-lg animate-shimmer" />
+                      </div>
+                      <div className="h-6 w-20 rounded-full animate-shimmer" />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="h-4 w-24 rounded-lg animate-shimmer" />
+                      <div className="h-4 w-24 rounded-lg animate-shimmer" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : sessionsToday.length === 0 ? (
+              <div className="py-16 text-center">
+                <p className="text-sm font-semibold text-slate-400">No schedule today</p>
+                <p className="text-xs font-medium text-slate-400 mt-1">Use this time to check your teaching history.</p>
+              </div>
+            ) : (
+              <>
+                <div>
+                  {currentSchedules.length > 0 ? (
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                      {currentSchedules.map((schedule) => renderScheduleCard(schedule, true))}
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/60 p-4 text-center text-slate-400">
+                      <p className="text-sm font-semibold">No active or upcoming schedule</p>
+                    </div>
+                  )}
+                </div>
+
+                {pastSchedules.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400 mb-3 px-1">
+                      Past
+                    </p>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                      {pastSchedules.map((schedule) => renderScheduleCard(schedule, true))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="animate-fade-up" style={{ animationDelay: '0.15s' }}>
+          <div className="flex justify-between items-center mb-4 lg:mb-6 px-1">
+            <h3 className="font-bold text-lg lg:text-xl text-slate-800">Recent Activity</h3>
+            <Link href="/asdos/riwayat-kehadiran" className="text-xs lg:text-sm font-semibold text-crimson active:scale-95 transition">
+              View All
+            </Link>
+          </div>
+          <div className="bg-white rounded-2xl shadow-md lg:shadow-sm border border-slate-100 p-4 lg:p-5 space-y-3">
+            {isPresensiLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 3 }, (_, i) => (
+                  <div key={i} className="rounded-2xl border border-slate-100 bg-slate-50/70 p-4 space-y-2 animate-pulse">
+                    <div className="h-4 w-2/3 bg-slate-100 rounded" />
+                    <div className="h-3.5 w-1/2 bg-slate-100 rounded mt-2" />
+                  </div>
+                ))}
+              </div>
+            ) : activityRows.length === 0 ? (
+              <div className="py-6 text-center text-slate-400">
+                <p className="text-sm font-semibold">No recent activity</p>
+                <p className="text-[10px] font-medium mt-1">Attendance verification or payment updates will appear here.</p>
+              </div>
+            ) : (
+              activityRows.map((item) => (
+                <div key={item.id} className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 transition-all duration-200 hover:bg-white hover:shadow-sm">
+                  <div className="flex justify-between items-start mb-1 gap-3">
+                    <h4 className="text-sm font-bold text-slate-800 truncate">{item.title}</h4>
+                    <span className="text-[10px] font-extrabold px-3 py-1 rounded-full shrink-0 bg-emerald-50 text-emerald-700 border border-emerald-100">
+                      {item.badge}
+                    </span>
+                  </div>
+                  <p className="text-[11px] font-bold text-slate-700 mb-2 truncate uppercase tracking-wider">
+                    {item.detail}
+                  </p>
+                  <p className="text-[10px] lg:text-xs text-slate-500 font-semibold">
+                    {formatShortDate(item.date)}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="animate-fade-up" style={{ animationDelay: '0.2s' }}>
+          <div className="flex justify-between items-center mb-4 lg:mb-6 px-1">
+            <h3 className="font-bold text-lg lg:text-xl text-slate-800">Substitute Class Status</h3>
+            <Link href="/asdos/pengajuan-kp" className="text-xs lg:text-sm font-semibold text-crimson active:scale-95 transition">
+              View All
+            </Link>
+          </div>
+          <div className="bg-white rounded-2xl shadow-md lg:shadow-sm border border-slate-100 p-4 lg:p-5 space-y-3">
+            {isKpLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 3 }, (_, i) => (
+                  <div key={i} className="rounded-2xl border border-slate-100 bg-slate-50/70 p-4 space-y-2 animate-pulse">
+                    <div className="h-4 w-2/3 bg-slate-100 rounded" />
+                    <div className="h-3.5 w-1/2 bg-slate-100 rounded mt-2" />
+                  </div>
+                ))}
+              </div>
+            ) : recentKpItems.length === 0 ? (
+              <div className="py-6 text-center text-slate-400">
+                <p className="text-sm font-semibold">No substitute class submissions yet</p>
+                <p className="text-[10px] font-medium mt-1">Submission status will appear here.</p>
+              </div>
+            ) : (
+              recentKpItems.map((item) => {
+                const isRejected = item.status === 'REJECTED';
+
+                return (
+                  <div key={item.id} className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 transition-all duration-200 hover:bg-white hover:shadow-sm">
+                    <div className="flex items-start justify-between gap-3 mb-1">
+                      <h4 className="text-sm font-bold text-slate-800 truncate">
+                        {item.session?.mata_kuliah ?? 'Substitute Class'}
+                      </h4>
+                      <span className={`text-[10px] font-extrabold px-3 py-1 rounded-full shrink-0 ${getKpStatusClass(item.status)}`}>
+                        {getKpStatusLabel(item.status)}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-700 truncate">
+                      {item.session?.nama_kelas ?? item.substitute_teacher}
+                    </p>
+                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] text-slate-700">
+                      <p>
+                        <span className="font-bold text-slate-500">Substitute: </span>
+                        <span>{formatShortDate(item.substitute_date)}</span>
+                      </p>
+                      <p>
+                        <span className="font-bold text-slate-500">Time: </span>
+                        <span>{item.time_slot || item.session?.waktu || '-'}</span>
+                      </p>
+                      <p className="truncate">
+                        <span className="font-bold text-slate-500">Room: </span>
+                        <span>{item.room || item.session?.ruangan || '-'}</span>
+                      </p>
+                    </div>
+                    {isRejected && item.coordinator_reason && (
+                      <div className="mt-3 rounded-xl bg-fog border border-slate-200 px-3 py-2">
+                        <p className="text-[11px] font-bold text-slate-800 mb-0.5">Rejection reason</p>
+                        <p className="text-xs text-slate-700 line-clamp-2">{item.coordinator_reason}</p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
